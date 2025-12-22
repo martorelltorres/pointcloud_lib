@@ -4,15 +4,16 @@ import rospy
 import rosbag
 import numpy as np
 import ros_numpy
+import open3d as o3d
 import os
-from nav_msgs.msg import Odometry
-from cola2_msgs.msg import NavSts 
+import copy
+import tf.transformations as tr 
 from scipy.interpolate import interp1d
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 
 def get_transform_matrix(position, rotation_matrix):
-    """Helper para construir matriz 4x4"""
+    """Construye matriz homogénea 4x4 (Vehículo -> Mundo)"""
     T = np.identity(4)
     T[:3, :3] = rotation_matrix
     T[0, 3] = position[0]
@@ -20,144 +21,205 @@ def get_transform_matrix(position, rotation_matrix):
     T[2, 3] = position[2]
     return T
 
+def get_static_transform_from_tf(bag_file, parent_frame, child_frame):
+    """Intenta leer /tf_static del bagfile para obtener T_S2V automáticamente"""
+    rospy.loginfo(f"Buscando transformación estática {parent_frame} -> {child_frame} en bagfile...")
+    try:
+        bag = rosbag.Bag(bag_file)
+        for _, msg, _ in bag.read_messages(topics=['/tf_static', '/tf']):
+            for transform in msg.transforms:
+                if transform.header.frame_id == parent_frame and transform.child_frame_id == child_frame:
+                    tx = transform.transform.translation.x
+                    ty = transform.transform.translation.y
+                    tz = transform.transform.translation.z
+                    qx = transform.transform.rotation.x
+                    qy = transform.transform.rotation.y
+                    qz = transform.transform.rotation.z
+                    qw = transform.transform.rotation.w
+                    
+                    T = tr.quaternion_matrix([qx, qy, qz, qw])
+                    T[0, 3] = tx
+                    T[1, 3] = ty
+                    T[2, 3] = tz
+                    rospy.loginfo("¡Transformación encontrada en /tf!")
+                    return T
+        bag.close()
+    except Exception:
+        pass
+    rospy.logwarn("No se encontró TF en el bagfile. Usando parámetros manuales.")
+    return None
+
+def save_pcd(pcd, filename, label):
+    if pcd is None or len(pcd.points) == 0: return
+    rospy.loginfo(f"  -> Guardando {label}: {os.path.basename(filename)} ({len(pcd.points)} pts)...")
+    o3d.io.write_point_cloud(filename, pcd, write_ascii=True)
+
 def main():
     rospy.init_node('multibeam_processor', anonymous=True)
     
-    # --- 1. OBTENER PARÁMETROS DE ROS ---
     try:
-        # Rutas y Topics
+        # --- PARÁMETROS ---
         bag_file = rospy.get_param('~bag_file')
         scan_topic = rospy.get_param('~scan_topic')
         nav_topic = rospy.get_param('~nav_topic')
-        file_interp = rospy.get_param('~file_interp')
-        file_nearest = rospy.get_param('~file_nearest')
+        output_dir = rospy.get_param('~output_dir')
         
-        # Transformación Estática (T_S2V)
-        offset_x = rospy.get_param('~offset_x', 0.0)
-        offset_y = rospy.get_param('~offset_y', 0.0)
-        offset_z = rospy.get_param('~offset_z', 0.0)
-        sensor_roll = rospy.get_param('~sensor_roll', 0.0)
-        sensor_pitch = rospy.get_param('~sensor_pitch', 0.0)
-        sensor_yaw = rospy.get_param('~sensor_yaw', np.radians(90)) # Default 90 deg
+        # Frames TF (Para búsqueda automática)
+        base_frame = rospy.get_param('~base_frame_id', 'sparus2/base_link')
+        sensor_frame = rospy.get_param('~sensor_frame_id', 'sparus2/multibeam')
+
+        # Fallback manual si no hay TF
+        off_x = rospy.get_param('~offset_x', 0.0)
+        off_y = rospy.get_param('~offset_y', 0.0)
+        off_z = rospy.get_param('~offset_z', 0.0)
+        sens_yaw = rospy.get_param('~sensor_yaw', 1.5708) 
         
+        # Configuración SLAM y Filtros
+        enable_slam = rospy.get_param('~enable_slam', True)
+        map_voxel = rospy.get_param('~slam_map_voxel', 0.5)
+        gicp_dist = rospy.get_param('~slam_gicp_dist', 2.0)
+        sor_k = rospy.get_param('~sor_k', 50)
+        sor_std = rospy.get_param('~sor_std', 1.0)
+        voxel_size = rospy.get_param('~voxel_size', 0.1)
+
     except KeyError as e:
-        rospy.logerr(f"Falta el parámetro de configuración crucial: {e}. Abortando.")
+        rospy.logerr(f"Falta parámetro: {e}")
         return
 
-    # --- 2. CONSTRUCCIÓN DE LA MATRIZ T_S2V CON PARÁMETROS ---
-    Rx_s = np.array([[1, 0, 0], [0, np.cos(sensor_roll), -np.sin(sensor_roll)], [0, np.sin(sensor_roll), np.cos(sensor_roll)]])
-    Ry_s = np.array([[np.cos(sensor_pitch), 0, np.sin(sensor_pitch)], [0, 1, 0], [-np.sin(sensor_pitch), 0, np.cos(sensor_pitch)]])
-    Rz_s = np.array([[np.cos(sensor_yaw), -np.sin(sensor_yaw), 0], [np.sin(sensor_yaw), np.cos(sensor_yaw), 0], [0, 0, 1]])
-    R_sensor = np.dot(Rz_s, np.dot(Ry_s, Rx_s))
+    # --- 1. OBTENER MATRIZ T_S2V (SENSOR -> VEHICULO) ---
+    # Intento 1: Leer del bagfile (/tf_static)
+    T_S2V = get_static_transform_from_tf(bag_file, base_frame, sensor_frame)
 
-    T_S2V = np.identity(4)
-    T_S2V[:3, :3] = R_sensor
-    T_S2V[0, 3] = offset_x
-    T_S2V[1, 3] = offset_y
-    T_S2V[2, 3] = offset_z
-    # ----------------------------------------------------------------------
-
-
-    print(f"Abriendo bagfile: {bag_file}...")
-    try:
-        bag = rosbag.Bag(bag_file)
-    except Exception as e:
-        rospy.logerr(f"Error al abrir el bagfile: {e}")
-        return
-
-    # 3. CARGAR DATOS DE NAVEGACIÓN
-    print("-> Indexando navegación...")
-    nav_times = []
-    nav_positions = []
-    nav_quats = [] 
-
-    for topic, msg, t in bag.read_messages(topics=[nav_topic]):
+    # Intento 2: Usar parámetros manuales
+    if T_S2V is None:
+        rospy.loginfo("Usando parámetros manuales para T_S2V...")
+        Rz = np.array([[np.cos(sens_yaw), -np.sin(sens_yaw), 0], [np.sin(sens_yaw), np.cos(sens_yaw), 0], [0, 0, 1]])
+        T_S2V = np.identity(4)
+        T_S2V[:3, :3] = Rz
+        T_S2V[0:3, 3] = [off_x, off_y, off_z]
+    
+    # --- 2. CARGAR NAVEGACIÓN (Roll/Pitch/Yaw del AUV) ---
+    rospy.loginfo("Indexando navegación y orientación del AUV...")
+    bag = rosbag.Bag(bag_file)
+    nav_times, nav_pos, nav_quats = [], [], []
+    
+    for _, msg, t in bag.read_messages(topics=[nav_topic]):
         nav_times.append(t.to_sec())
-        nav_positions.append([msg.position.north, msg.position.east, msg.position.depth])
-        
+        nav_pos.append([msg.position.north, msg.position.east, msg.position.depth])
+        # Aquí capturamos Roll, Pitch, Yaw dinámicos del AUV
         r = R.from_euler('xyz', [msg.orientation.roll, msg.orientation.pitch, msg.orientation.yaw], degrees=False)
         nav_quats.append(r.as_quat())
 
     nav_times = np.array(nav_times)
-    nav_positions = np.array(nav_positions)
-    nav_quats = np.array(nav_quats)
+    interp_pos = interp1d(nav_times, np.array(nav_pos), axis=0, kind='linear', fill_value="extrapolate")
+    slerp_rot = Slerp(nav_times, R.from_quat(np.array(nav_quats)))
 
-    # 4. CREAR INTERPOLADORES
-    interp_pos = interp1d(nav_times, nav_positions, axis=0, kind='linear', fill_value="extrapolate")
-    slerp_rot = Slerp(nav_times, R.from_quat(nav_quats))
-
-    total_scans = bag.get_message_count(scan_topic)
-    rospy.loginfo(f"Datos de NAV indexados. Procesando {total_scans} scans...")
-
-    buffer_interp = []
-    buffer_nearest = []
+    # --- 3. PROCESAMIENTO ---
+    buffer_odom_raw = []
+    buffer_slam = []
+    global_map = o3d.geometry.PointCloud()
+    total = bag.get_message_count(scan_topic)
+    cnt = 0
     
-    count = 0
+    rospy.loginfo(f"Procesando {total} scans...")
 
-    # 5. BUCLE PRINCIPAL DE PROCESAMIENTO
     for topic, scan_msg, t in bag.read_messages(topics=[scan_topic]):
-        scan_time = t.to_sec()
-        
-        # Filtros de tiempo
-        if scan_time < nav_times[0] or scan_time > nav_times[-1]:
-            continue
+        t_sec = t.to_sec()
+        if t_sec < nav_times[0] or t_sec > nav_times[-1]: continue
 
-        # A. Obtener Puntos Locales
         try:
-            pc_data = ros_numpy.point_cloud2.pointcloud2_to_array(scan_msg)
-            mask = np.isfinite(pc_data['x']) & np.isfinite(pc_data['y']) & np.isfinite(pc_data['z'])
-            pc_data = pc_data[mask]
-        except Exception as e:
-            rospy.logwarn(f"Error al procesar PointCloud2: {e}")
-            continue
+            # A. Puntos en el marco del SENSOR (Multibeam Frame)
+            pc = ros_numpy.point_cloud2.pointcloud2_to_array(scan_msg)
+            mask = np.isfinite(pc['x'])
+            pc = pc[mask]
+            if len(pc) < 10: continue
 
-        if len(pc_data) == 0: continue
-        
-        ones = np.ones((len(pc_data), 1))
-        points_local = np.column_stack((pc_data['x'], pc_data['y'], pc_data['z'], ones))
-
-        # --- MÉTODO 1: INTERPOLACIÓN (SLERP) ---
-        try:
-            pos_i = interp_pos(scan_time)
-            rot_i = slerp_rot(scan_time).as_matrix()
-            T_world_i = np.dot(get_transform_matrix(pos_i, rot_i), T_S2V)
-            pts_world_i = np.dot(T_world_i, points_local.T).T
+            xyz_local = np.column_stack((pc['x'], pc['y'], pc['z'])).astype(np.float64)
+            pcd_local = o3d.geometry.PointCloud()
+            pcd_local.points = o3d.utility.Vector3dVector(xyz_local)
             
-            for p in pts_world_i:
-                buffer_interp.append(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
-        except Exception as e:
-            rospy.logwarn(f"Fallo en interpolación: {e}")
+            # B. Transformar al marco del VEHÍCULO (Base Link) usando T_S2V fija
+            pcd_vehicle = pcd_local.transform(T_S2V)
 
-        # --- MÉTODO 2: VECINO MÁS CERCANO (Nearest Neighbor) ---
-        try:
-            idx_near = (np.abs(nav_times - scan_time)).argmin()
-            pos_n = nav_positions[idx_near]
-            rot_n = R.from_quat(nav_quats[idx_near]).as_matrix()
+            # C. Transformar al marco MUNDO (World NED) usando Pose Dinámica del AUV
+            pos_pred = interp_pos(t_sec)
+            rot_pred = slerp_rot(t_sec).as_matrix()
             
-            T_world_n = np.dot(get_transform_matrix(pos_n, rot_n), T_S2V)
-            pts_world_n = np.dot(T_world_n, points_local.T).T
+            T_odom = get_transform_matrix(pos_pred, rot_pred)
 
-            for p in pts_world_n:
-                buffer_nearest.append(f"{p[0]:.4f} {p[1]:.4f} {p[2]:.4f}\n")
-        except Exception as e:
-            rospy.logwarn(f"Fallo en vecino cercano: {e}")
+            # --- BUFFER 1: ODOMETRÍA PURA ---
+            pcd_odom_frame = copy.deepcopy(pcd_vehicle).transform(T_odom)
+            
+            # MODIFICACIÓN: Invertir Z para el guardado (Profundidad -> Elevación)
+            pts_odom_save = np.asarray(pcd_odom_frame.points)
+            pts_odom_save[:, 2] *= -1.0 
+            buffer_odom_raw.append(pts_odom_save)
+
+            # --- BUFFER 2: SLAM (Corrección sobre la odometría) ---
+            T_corrected = T_odom 
+
+            if enable_slam and len(global_map.points) > 500:
+                source = pcd_vehicle 
+                try:
+                    source.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=1.0, max_nn=30))
+                    reg = o3d.pipelines.registration.registration_generalized_icp(
+                        source, global_map, 
+                        max_correspondence_distance=gicp_dist,
+                        init=T_odom,
+                        estimation_method=o3d.pipelines.registration.TransformationEstimationForGeneralizedICP(),
+                        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=15) 
+                    )
+                    T_corrected = reg.transformation
+                except Exception:
+                    pass
+            
+            pcd_slam_frame = copy.deepcopy(pcd_vehicle).transform(T_corrected)
+            
+            # MODIFICACIÓN: Invertir Z SOLO para el buffer de guardado, no para el mapa
+            pts_slam_numpy = np.asarray(pcd_slam_frame.points)
+            
+            # Copia para guardar con Z negativa
+            pts_slam_save = pts_slam_numpy.copy()
+            pts_slam_save[:, 2] *= -1.0
+            buffer_slam.append(pts_slam_save)
+
+            if enable_slam:
+                # Al mapa global lo añadimos con la Z original (Positiva/NED) para que las matemáticas cuadren
+                global_map += pcd_slam_frame
+                if cnt % 20 == 0: 
+                    global_map = global_map.voxel_down_sample(voxel_size=map_voxel)
+                    global_map.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=map_voxel*2, max_nn=30))
+
+        except Exception:
+            pass
         
-        count += 1
-        if count % 100 == 0:
-            rospy.loginfo(f"Procesados: {count}/{total_scans} scans")
+        cnt += 1
+        if cnt % 100 == 0:
+            print(f"Procesando: {cnt}/{total}", end='\r')
 
     bag.close()
     
-    # 6. Guardar Archivos
-    rospy.loginfo(f"Guardando {file_interp} ({len(buffer_interp)} puntos)...")
-    with open(file_interp, 'w') as f:
-        f.writelines(buffer_interp)
-
-    rospy.loginfo(f"Guardando {file_nearest} ({len(buffer_nearest)} puntos)...")
-    with open(file_nearest, 'w') as f:
-        f.writelines(buffer_nearest)
+    # --- GUARDADO ---
+    # 1. RAW Odometría
+    if buffer_odom_raw:
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(np.vstack(buffer_odom_raw))
+        save_pcd(pcd, output_dir + "1_mb_RAW_odom.xyz", "RAW Odometry (Z-)")
         
-    rospy.loginfo("Procesamiento finalizado. Archivos guardados.")
+        # 2. SOR
+        pcd_sor, _ = pcd.remove_statistical_outlier(nb_neighbors=sor_k, std_ratio=sor_std)
+        save_pcd(pcd_sor, output_dir + "2_mb_SOR.xyz", "SOR Filtered (Z-)")
+
+        # 3. VOXEL
+        pcd_vox = pcd.voxel_down_sample(voxel_size=voxel_size)
+        save_pcd(pcd_vox, output_dir + "3_mb_VOXEL.xyz", "Voxel Grid (Z-)")
+    
+    # 4. SLAM
+    if buffer_slam:
+        pcd_slam = o3d.geometry.PointCloud()
+        pcd_slam.points = o3d.utility.Vector3dVector(np.vstack(buffer_slam))
+        pcd_slam = pcd_slam.voxel_down_sample(voxel_size=voxel_size)
+        save_pcd(pcd_slam, output_dir + "4_mb_SLAM_corrected.xyz", "SLAM Corrected (Z-)")
 
 if __name__ == '__main__':
     main()
