@@ -1,249 +1,235 @@
 #!/usr/bin/env python3
 
-import rospy
 import rosbag
 import numpy as np
 import cv2
-from cv_bridge import CvBridge
+import os
 from scipy.interpolate import interp1d
 import rasterio
 from rasterio.transform import from_origin
-import pyproj
-import os
-import sys
 
-# --- CONFIGURACIÓN ---
-BAG_FILE = '/home/uib/bagfiles/cabrera/2025_10_27/13_43_54/sparus2_sidescan_2025-10-27-13-43-54_0.bag' 
-OUTPUT_TIFF = 'mosaico_ned_final.tif'
+# ================= CONFIGURACIÓN =================
+BAG_FILE = '/home/uib/bagfiles/cabrera/2025_10_29/16_20_34/sparus2_sidescan_2025-10-29-16-20-34_0.bag'
+NAV_TOPIC = '/sparus2/navigator/navigation'
+OUTPUT_TIFF = 'sss_mosaic_color.tif'
 
-# PARÁMETROS DEL SONAR
-SONAR_RANGE = 30.0   
-BLIND_ZONE = 0.5     
-MOSAIC_RES = 0.1     
+SONAR_RANGE = 30.0      # m
+MOSAIC_RES  = 0.1       # m / pixel
+BLIND_ZONE  = 0.5       # m
+SENSOR_OFFSET = 0.2     # m (offset lateral del SSS)
 
-# FRAMES
-FRAME_BASE = "sparus2/base_link"
-FRAME_PORT = "sparus2/sidescan_port"
-FRAME_STBD = "sparus2/sidescan_starboard"
-# ----------------------
+# ================= FILTRADO =================
+def enhance_data(img_input):
+    if img_input is None or img_input.size == 0:
+        return np.zeros_like(img_input, dtype=np.uint8)
 
-class TFManager:
-    """Extrae la posición de montaje (Offset) de los sensores desde el bag"""
-    def __init__(self):
-        self.offsets = {} 
+    valid = img_input > 0
+    if not np.any(valid):
+        return np.zeros_like(img_input, dtype=np.uint8)
 
-    def load_static_tfs(self, bag):
-        print("-> Leyendo TFs estáticas...")
-        for topic, msg, t in bag.read_messages(topics=['/tf_static', '/tf']):
-            for transform in msg.transforms:
-                parent = transform.header.frame_id
-                child = transform.child_frame_id
-                
-                if child in [FRAME_PORT, FRAME_STBD] and parent == FRAME_BASE:
-                    tx = transform.transform.translation.x
-                    ty = transform.transform.translation.y
-                    tz = transform.transform.translation.z
-                    self.offsets[child] = np.array([tx, ty, tz])
-        
-        # Defaults
-        if FRAME_PORT not in self.offsets: self.offsets[FRAME_PORT] = np.zeros(3)
-        if FRAME_STBD not in self.offsets: self.offsets[FRAME_STBD] = np.zeros(3)
-        
-        print(f" [INFO] Offset Babor: {self.offsets[FRAME_PORT]}")
-        print(f" [INFO] Offset Estribor: {self.offsets[FRAME_STBD]}")
+    vmin, vmax = np.percentile(img_input[valid], (2, 98))
+    if vmax <= vmin:
+        vmax = vmin + 1e-5
 
-    def get_offset(self, child_frame):
-        return self.offsets.get(child_frame, np.zeros(3))
+    img = np.clip((img_input - vmin) * 255.0 / (vmax - vmin), 0, 255).astype(np.uint8)
 
-def get_nav_data(bag, topic_nav):
-    print(f"\n-> Procesando navegación (Lógica NED pura)...")
-    timestamps, northings, eastings, yaws_ned = [], [], [], []
-    
-    # Proyección: Lat/Lon -> UTM (Metros)
-    # Nota: pyproj devuelve (Este, Norte)
-    proj_wgs84 = pyproj.CRS("EPSG:4326")
-    proj_utm = pyproj.CRS("EPSG:32631") 
-    transformer = pyproj.Transformer.from_crs(proj_wgs84, proj_utm, always_xy=True)
+    img = cv2.medianBlur(img, 5)
 
-    for topic, msg, t in bag.read_messages(topics=[topic_nav]):
-        ts = msg.header.stamp.to_sec() if hasattr(msg.header, 'stamp') else t.to_sec()
-        try:
-            # global_position suele ser Lat/Lon
-            east, north = transformer.transform(msg.global_position.longitude, msg.global_position.latitude)
-            
-            timestamps.append(ts)
-            northings.append(north)
-            eastings.append(east)
-            # Guardamos Yaw NED sin modificar (0=Norte, Clockwise)
-            yaws_ned.append(msg.orientation.yaw) 
-        except: continue
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    img = clahe.apply(img)
 
-    if not timestamps: return None
+    kernel = np.array([[0,-1,0],
+                       [-1,5,-1],
+                       [0,-1,0]])
+    img = cv2.filter2D(img, -1, kernel)
 
-    # Ordenar cronológicamente
-    t_arr = np.array(timestamps)
-    idx = np.argsort(t_arr)
-    t_arr = t_arr[idx]
-    
-    # Unwrap del yaw
-    yaw_continuous = np.unwrap(np.array(yaws_ned)[idx])
+    return img
 
-    # Interpoladores
-    interp_east = interp1d(t_arr, np.array(eastings)[idx], kind='linear', bounds_error=False, fill_value=np.nan)
-    interp_north = interp1d(t_arr, np.array(northings)[idx], kind='linear', bounds_error=False, fill_value=np.nan)
-    interp_yaw = interp1d(t_arr, yaw_continuous, kind='linear', bounds_error=False, fill_value=np.nan)
+# ================= NAVEGACIÓN (NavSts) =================
+def get_nav_data(bag):
+    print("-> Leyendo navegación (cola2_msgs/NavSts)...")
 
-    return interp_east, interp_north, interp_yaw, proj_utm, (t_arr[0], t_arr[-1])
+    ts, north, east, yaw, alt = [], [], [], [], []
 
-def process_sonar_images(bag, nav_data, tf_man):
-    print(f"\n-> Proyectando imágenes (Lógica Física Estricta NED)...")
-    
+    for _, msg, _ in bag.read_messages(topics=[NAV_TOPIC]):
+        if not hasattr(msg, 'header'):
+            continue
+
+        ts.append(msg.header.stamp.to_sec())
+        north.append(msg.position.north)
+        east.append(msg.position.east)
+        yaw.append(msg.orientation.yaw)
+        alt.append(msg.altitude)
+
+    if len(ts) == 0:
+        return None
+
+    ts = np.array(ts)
+    idx = np.argsort(ts)
+
+    ts = ts[idx]
+    north = np.array(north)[idx]
+    east  = np.array(east)[idx]
+    yaw   = np.unwrap(np.array(yaw)[idx])
+    alt   = np.array(alt)[idx]
+
+    f_n = interp1d(ts, north, bounds_error=False, fill_value=np.nan)
+    f_e = interp1d(ts, east,  bounds_error=False, fill_value=np.nan)
+    f_y = interp1d(ts, yaw,   bounds_error=False, fill_value=np.nan)
+    f_h = interp1d(ts, alt,   bounds_error=False, fill_value=np.nan)
+
+    bounds = (np.min(east), np.max(east),
+              np.min(north), np.max(north))
+
+    return (f_n, f_e, f_y, f_h), (ts[0], ts[-1]), bounds
+
+# ================= MOSAICO =================
+def process_mosaic(bag, nav, time_range, bounds):
+    f_n, f_e, f_y, f_h = nav
+    t0, t1 = time_range
+    min_e, max_e, min_n, max_n = bounds
+
+    margin = SONAR_RANGE + 10
+    x_min, x_max = min_e - margin, max_e + margin
+    y_min, y_max = min_n - margin, max_n + margin
+
+    width  = int(np.ceil((x_max - x_min) / MOSAIC_RES))
+    height = int(np.ceil((y_max - y_min) / MOSAIC_RES))
+
+    print(f"-> Grid: {width} x {height} px")
+
+    grid_p = np.zeros(width * height, dtype=np.float32)
+    cnt_p  = np.zeros(width * height, dtype=np.float32)
+    grid_s = np.zeros(width * height, dtype=np.float32)
+    cnt_s  = np.zeros(width * height, dtype=np.float32)
+
+    def to_idx(e, n):
+        c = ((e - x_min) / MOSAIC_RES).astype(np.int32)
+        r = ((y_max - n) / MOSAIC_RES).astype(np.int32)
+        return c, r
+
     info = bag.get_type_and_topic_info()
-    sss_topics = [t for t in info.topics.keys() if "sidescan" in t and "raw_data" in t and "info" not in t]
-    
-    interp_east, interp_north, interp_yaw, _, (t_start, t_end) = nav_data
-    bridge = CvBridge()
-    global_x, global_y, intensities = [], [], []
-    stats = {'ok': 0}
+    sss_topics = [t for t in info.topics if "sidescan" in t]
 
-    for topic, msg, t in bag.read_messages(topics=sss_topics):
-        t_img = msg.header.stamp.to_sec() if hasattr(msg.header, 'stamp') else t.to_sec()
-        if t_img < t_start or t_img > t_end: continue
+    print("-> Proyectando píxeles SSS...")
+    for topic, msg, _ in bag.read_messages(topics=sss_topics):
 
-        # 1. ESTADO DEL AUV (Yaw NED Original)
-        auv_east = interp_east(t_img)
-        auv_north = interp_north(t_img)
-        yaw_auv = interp_yaw(t_img) 
+        if not hasattr(msg, 'header') or not hasattr(msg, 'data'):
+            continue
 
-        if np.isnan(auv_east): continue
+        ts = msg.header.stamp.to_sec()
+        if ts < t0 or ts > t1:
+            continue
 
-        # 2. POSICIÓN REAL DEL SENSOR (Usando TF y trigonometría NED)
-        # Calculamos sen/cos del AUV para rotar el offset
-        c_auv = np.cos(yaw_auv)
-        s_auv = np.sin(yaw_auv)
+        n = f_n(ts)
+        e = f_e(ts)
+        yaw = f_y(ts)
+        h = f_h(ts)
+
+        if np.isnan(n) or h < 0.2:
+            continue
+
+        scan = np.frombuffer(msg.data, dtype=np.uint8)
+        if "port" in topic:
+            scan = scan[::-1]
+            
+        if scan.size < 50:
+            continue
+
+        npx = scan.size
+        meters_px = SONAR_RANGE / npx
+        slant = np.arange(npx) * meters_px
+        ground = np.sqrt(np.maximum(slant**2 - h**2, 0))
+
+        valid = ground > BLIND_ZONE
+        if not np.any(valid):
+            continue
+
+        vals = scan[valid]
+        ranges = ground[valid]
+
+        v_right_n = -np.sin(yaw)
+        v_right_e =  np.cos(yaw)
 
         if "port" in topic:
-            off = tf_man.get_offset(FRAME_PORT)
+            beam_n = -v_right_n
+            beam_e = -v_right_e
+            grid, cnt = grid_p, cnt_p
         else:
-            off = tf_man.get_offset(FRAME_STBD)
-        
-        # Rotar Offset (Body -> NED World)
-        # En NED: X (Forward) -> cos(yaw) en Norte, sin(yaw) en Este
-        #         Y (Right)   -> -sin(yaw) en Norte, cos(yaw) en Este
-        sensor_north = auv_north + (off[0] * c_auv - off[1] * s_auv)
-        sensor_east  = auv_east  + (off[0] * s_auv + off[1] * c_auv)
+            beam_n = +v_right_n
+            beam_e = +v_right_e
+            grid, cnt = grid_s, cnt_s
 
-        # ---------------------------------------------------------
-        # 3. CÁLCULO EXPLÍCITO DE LA DIRECCIÓN DE DISPARO (CORRECCIÓN)
-        # ---------------------------------------------------------
-        if "starboard" in topic:
-            # Estribor: Dispara a 90 grados en sentido HORARIO (+pi/2)
-            beam_yaw = yaw_auv + (np.pi / 2.0)
-        else: # Port
-            # Babor: Dispara a 90 grados en sentido ANTI-HORARIO (-pi/2)
-            beam_yaw = yaw_auv - (np.pi / 2.0)
+        # Offset del sensor (una sola vez)
+        start_n = n + beam_n * SENSOR_OFFSET
+        start_e = e + beam_e * SENSOR_OFFSET
 
-        # 4. OBTENCIÓN DEL VECTOR UNITARIO DEL HAZ
-        # En nuestro mapeo NED manual:
-        # Componente Norte (X) = cos(angulo)
-        # Componente Este (Y)  = sin(angulo)
-        # Esto funciona porque definimos Norte=X, Este=Y y el ángulo 0 empieza en X.
-        vec_beam_north = np.cos(beam_yaw)
-        vec_beam_east  = np.sin(beam_yaw)
+        # Proyección correcta del haz
+        px_n = start_n + beam_n * ranges
+        px_e = start_e + beam_e * ranges
 
-        # 5. DECODIFICACIÓN
-        scan_line = None
-        if hasattr(msg, 'encoding') and msg.encoding == "8UC1":
-            try: scan_line = np.frombuffer(msg.data, dtype=np.uint8)
-            except: pass
-        if scan_line is None:
-            try:
-                cv_img = bridge.imgmsg_to_cv2(msg, desired_encoding="mono8")
-                scan_line = cv_img.flatten()
-            except: continue
+        c, r = to_idx(px_e, px_n)
+        mask = (c >= 0) & (c < width) & (r >= 0) & (r < height)
+        idx = r[mask] * width + c[mask]
 
-        n_pixels = len(scan_line)
-        if n_pixels == 0: continue
+        np.add.at(grid, idx, vals[mask])
+        np.add.at(cnt, idx, 1)
 
-        meters_per_pixel = SONAR_RANGE / n_pixels
-        dist_array = np.arange(n_pixels) * meters_per_pixel
-        
-        mask = dist_array > BLIND_ZONE
-        valid_dist = dist_array[mask]
-        valid_vals = scan_line[mask]
+    return grid_p, cnt_p, grid_s, cnt_s, width, height, x_min, y_max
 
-        if len(valid_dist) == 0: continue
+# ================= GUARDADO =================
+def save_geotiff(gp, cp, gs, cs, w, h, x_min, y_max):
+    print("-> Generando GeoTIFF...")
 
-        # 6. PROYECCIÓN FINAL (Rasterio usa X=Este, Y=Norte)
-        px = sensor_east + (vec_beam_east * valid_dist)
-        py = sensor_north + (vec_beam_north * valid_dist)
+    port = np.zeros(w * h, dtype=np.float32)
+    stbd = np.zeros(w * h, dtype=np.float32)
 
-        global_x.extend(px)
-        global_y.extend(py)
-        intensities.extend(valid_vals)
+    mask = cp > 0
+    port[mask] = gp[mask] / cp[mask]
 
-        stats['ok'] += 1
-        if stats['ok'] % 5000 == 0: print(f"   Líneas: {stats['ok']}...", end='\r')
+    mask = cs > 0
+    stbd[mask] = gs[mask] / cs[mask]
 
-    print(f"\n-> Fin. Líneas procesadas: {stats['ok']}")
-    if stats['ok'] == 0: return None, None, None
-    return np.array(global_x), np.array(global_y), np.array(intensities)
+    port = enhance_data(port.reshape((h, w)))
+    stbd = enhance_data(stbd.reshape((h, w)))
 
-def rasterize_and_save(x, y, i, res, output_file, crs):
-    print(f"-> Rasterizando...")
-    x_min, x_max = x.min(), x.max()
-    y_min, y_max = y.min(), y.max()
-    if x_min == x_max: return
+    transform = from_origin(x_min, y_max, MOSAIC_RES, MOSAIC_RES)
 
-    width = int(np.ceil((x_max - x_min) / res))
-    height = int(np.ceil((y_max - y_min) / res))
-    
-    print(f"   Mapa: {width}x{height} px | {x_max-x_min:.1f}m x {y_max-y_min:.1f}m")
-    
-    col = np.clip(((x - x_min) / res).astype(np.int32), 0, width - 1)
-    row = np.clip(((y_max - y) / res).astype(np.int32), 0, height - 1)
-    
-    flat = row * width + col
-    grid_sum = np.zeros(width * height, dtype=np.float32)
-    grid_cnt = np.zeros(width * height, dtype=np.float32)
-    
-    np.add.at(grid_sum, flat, i)
-    np.add.at(grid_cnt, flat, 1)
-    
-    mosaic = np.zeros(width * height, dtype=np.uint8)
-    mask = grid_cnt > 0
-    mosaic[mask] = (grid_sum[mask] / grid_cnt[mask]).astype(np.uint8)
-    mosaic = mosaic.reshape((height, width))
+    with rasterio.open(
+        OUTPUT_TIFF, 'w',
+        driver='GTiff',
+        height=h, width=w,
+        count=3,
+        dtype=np.uint8,
+        transform=transform,
+        nodata=0
+    ) as dst:
+        dst.write(port, 1)   # Rojo: Babor
+        dst.write(stbd, 2)   # Verde: Estribor
+        dst.write(np.zeros((h, w), dtype=np.uint8), 3)
 
-    transform = from_origin(x_min, y_max, res, res)
-    with rasterio.open(output_file, 'w', driver='GTiff', height=height, width=width, 
-                       count=1, dtype=mosaic.dtype, crs=crs, transform=transform, nodata=0) as dst:
-        dst.write(mosaic, 1)
-    print(f"-> Guardado: {os.path.abspath(output_file)}")
+    print(f"✔ GeoTIFF guardado: {os.path.abspath(OUTPUT_TIFF)}")
 
+# ================= MAIN =================
 def main():
-    if not os.path.exists(BAG_FILE): 
-        print("ERROR: Bag no encontrado"); return
-    
-    try: bag = rosbag.Bag(BAG_FILE)
-    except Exception as e: 
-        print(f"ERROR: {e}"); return
+    if not os.path.exists(BAG_FILE):
+        print("ERROR: Bag no encontrado")
+        return
 
-    # 1. TFs
-    tf_man = TFManager()
-    tf_man.load_static_tfs(bag)
-    
-    # 2. Nav (NED)
-    TOPIC_NAV = '/sparus2/navigator/navigation'
-    nav_data = get_nav_data(bag, TOPIC_NAV)
+    bag = rosbag.Bag(BAG_FILE)
 
-    if nav_data:
-        # 3. Procesar
-        gx, gy, gi = process_sonar_images(bag, nav_data, tf_man)
-        if gx is not None:
-            rasterize_and_save(gx, gy, gi, MOSAIC_RES, OUTPUT_TIFF, nav_data[3])
+    nav = get_nav_data(bag)
+    if nav is None:
+        print("ERROR: navegación vacía")
+        return
 
+    nav_funcs, t_range, bounds = nav
+    gp, cp, gs, cs, w, h, xmin, ymax = process_mosaic(
+        bag, nav_funcs, t_range, bounds
+    )
+
+    save_geotiff(gp, cp, gs, cs, w, h, xmin, ymax)
     bag.close()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
