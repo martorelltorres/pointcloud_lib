@@ -1,9 +1,6 @@
 <launch>
-    <arg name="bag_path" default="/home/uib/bagfiles/cabrera/2025_10_28/14_44_35/"/> 
-    <!-- <arg name="bag_name" default="sparus2_multibeam_2025-11-10-10-18-53_0.bag"/> -->
-    <arg name="bag_name" default="sparus2_multibeam_2025-10-28-14-44-35_0.bag"/>
-    
-    <!-- <arg name="bag_name" default="sparus2_multibeam_2025-11-10-11-31-34_01.bag"/> -->
+    <arg name="bag_file" default="/home/uib/bagfiles/cabrera/2025_10_28/14_44_35/sparus2_multibeam_2025-10-28-14-44-35_0.bag"/>
+        <!-- <arg name="bag_file" default="/home/uib/bagfiles/El_Sec/11_31_3/other/sparus2_multibeam_2025-11-10-11-31-34_0.bag"/> -->
     <arg name="output_dir" default="/home/uib/derelictes_ws/bagfiles/results/"/>
     
     <arg name="offset_x" default="0.0"/>
@@ -15,14 +12,14 @@
     <arg name="sor_std" default="1.0"/>
     <arg name="voxel_size" default="0.1"/>
 
-    <arg name="enable_slam" default="true"/>
+    <arg name="enable_slam" default="false"/>
     <arg name="slam_map_voxel" default="0.5"/>
     <arg name="slam_gicp_dist" default="2.0"/>
 
     <param name="use_sim_time" value="true"/>
     
     <node pkg="pointcloud_lib" type="multibeam_processor.py" name="mb_multi_proc" output="screen" required="true">
-        <param name="bag_file"      value="$(arg bag_path)$(arg bag_name)" />
+        <param name="bag_file"      value="$(arg bag_file)" />
         <param name="scan_topic"    value="/sparus2/norbit_wbms_multibeam/multibeam_scan" />
         <param name="nav_topic"     value="/sparus2/navigator/navigation" />
         <param name="output_dir"    value="$(arg output_dir)" />
