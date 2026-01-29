@@ -92,9 +92,10 @@ def main():
     base_frame   = rospy.get_param('~base_frame_id', 'sparus2/base_link')
     sensor_frame = rospy.get_param('~sensor_frame_id', 'sparus2/multibeam')
 
-    voxel_size = rospy.get_param('~voxel_size', 0.5)
+    voxel_size = rospy.get_param('~voxel_size', 0.05)
     sor_k      = rospy.get_param('~sor_k', 50)
     sor_std    = rospy.get_param('~sor_std', 1.0)
+    poisson_depth = rospy.get_param('~poisson_depth', 10)
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -194,7 +195,9 @@ def main():
     pcd.points = o3d.utility.Vector3dVector(pts_all)
 
     pcd, _ = pcd.remove_statistical_outlier(sor_k, sor_std)
-    pcd = pcd.voxel_down_sample(voxel_size)
+
+    if voxel_size > 0:
+        pcd = pcd.voxel_down_sample(voxel_size)
 
     xyz_file = os.path.join(output_dir, "mb_surface.xyz")
     save_pcd(pcd, xyz_file, "Multibeam XYZ (UTM)")
@@ -211,20 +214,33 @@ def main():
     pcd.points = o3d.utility.Vector3dVector(pts_centered)
 
     rospy.loginfo("Estimating normals...")
+    normal_radius = rospy.get_param('~normal_radius', 0.5)
+
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(
-            radius=voxel_size * 3,
-            max_nn=50
+            radius=normal_radius,
+            max_nn=100
         )
     )
+
+    # pcd.estimate_normals(
+    #     search_param=o3d.geometry.KDTreeSearchParamHybrid(
+    #         radius=voxel_size * 3,
+    #         max_nn=50
+    #     )
+    # )
 
     # pcd.orient_normals_consistent_tangent_plane(50)
 
     rospy.loginfo("Poisson surface reconstruction...")
-    mesh, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+    mesh, density = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
         pcd,
-        depth=8
+        depth=poisson_depth
     )
+
+    density = np.asarray(density)
+    mask = density > np.percentile(density, 5)
+    mesh = mesh.select_by_index(np.where(mask)[0])
 
     bbox = pcd.get_axis_aligned_bounding_box()
     mesh = mesh.crop(bbox)
