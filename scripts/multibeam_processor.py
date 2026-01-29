@@ -166,8 +166,13 @@ def main():
 
         # VEHICLE → WORLD (UTM ABSOLUTO)
         pos_local = interp_pos(ts)         # [north, east, depth]
-        rot = slerp_rot(ts).as_matrix()
+        # rot = slerp_rot(ts).as_matrix()
+        rot_nav = slerp_rot(ts).as_matrix()
 
+        # Rotación correctora: 180 grados alrededor de Z
+        R_fix = R.from_euler('z', np.pi).as_matrix()
+
+        rot = R_fix @ rot_nav
         pos_utm = np.array([
             X0_UTM + pos_local[1],   # east  → X
             Y0_UTM + pos_local[0],   # north → Y

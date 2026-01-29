@@ -14,39 +14,48 @@ from scipy.interpolate import interp1d
 import rasterio
 from rasterio.transform import from_origin
 from pyproj import Transformer
+import tf.transformations as tr   # <-- NUEVO
 
 # ================= CONFIGURATION =================
 
-# BAG_FILE = '/home/uib/bagfiles/cabrera/2025_10_28/12_31_49/sparus2_sidescan_2025-10-28-12-31-50_0.bag'
-
-# BAG_FILE = '/home/uib/bagfiles/cabrera/2025_10_29/16_20_34/sparus2_sidescan_2025-10-29-16-20-34_0.bag'
-# BAG_FILE = '/home/uib/bagfiles/cabrera/2025_10_28/12_31_49/sparus2_sidescan_2025-10-28-12-31-50_0.bag'
-# BAG_FILE = '/home/uib/bagfiles/cabrera/2025_10_29/11_01_09/sparus2_sidescan_2025-10-29-11-01-09_0.bag'
-# BAG_FILE = '/home/uib/bagfiles/cabrera/2025_10_28/10_56_48/sparus2_sidescan_2025-10-28-10-56-48_0.bag'
-# BAG_FILE = '/home/uib/bagfiles/El_Sec/toni/09_41_47/sparus2_sidescan_2025-11-10-09-41-47_0.bag'
 BAG_FILE = '/home/uib/bagfiles/cabrera/2025_10_28/10_56_48/sparus2_sidescan_2025-10-28-10-56-48_0.bag'
 
 NAV_TOPIC = '/sparus2/navigator/navigation'
+BASE_FRAME = 'sparus2/base_link'
+SSS_FRAME  = 'sparus2/sidescan'
+
 OUTPUT_TIFF = 'sss_mosaic.tif'
 
-SONAR_RANGE = 30.0       # Sonar range in meters
-MOSAIC_RES  =  0.07        # Mosaic resolution (m/pixel)
-BLIND_ZONE  = 0.2        # Blind zone near nadir (m)
-SENSOR_OFFSET = 0.1      # Lateral sensor offset (m)
+SONAR_RANGE = 30.0
+MOSAIC_RES  = 0.07
+BLIND_ZONE  = 0.2
 
 # === Coordinate Reference Systems ===
 CRS_WGS84 = "EPSG:4326"
-CRS_UTM   = "EPSG:32631"   # UTM zone for the Balearic Islands
-
-# ================= TRANSFORMERS =================
+CRS_UTM   = "EPSG:32631"
 
 ll_to_utm = Transformer.from_crs(CRS_WGS84, CRS_UTM, always_xy=True)
-utm_to_ll = Transformer.from_crs(CRS_UTM, CRS_WGS84, always_xy=True)
+
+# ================= TF UTIL =================
+
+def get_static_tf(bag, parent_frame, child_frame):
+    for _, msg, _ in bag.read_messages(topics=['/tf_static', '/tf']):
+        for t in msg.transforms:
+            if (t.header.frame_id == parent_frame and
+                t.child_frame_id == child_frame):
+
+                q = t.transform.rotation
+                p = t.transform.translation
+
+                T = tr.quaternion_matrix([q.x, q.y, q.z, q.w])
+                T[:3, 3] = [p.x, p.y, p.z]
+                return T
+
+    raise RuntimeError(f"TF {parent_frame} → {child_frame} not found in bag")
 
 # ================= IMAGE UTILITIES =================
 
 def enhance_data(img_input):
-    """Enhance SSS image contrast and sharpness for visualization."""
     if img_input is None or img_input.size == 0:
         return np.zeros_like(img_input, dtype=np.uint8)
 
@@ -54,65 +63,41 @@ def enhance_data(img_input):
     if not np.any(valid):
         return np.zeros_like(img_input, dtype=np.uint8)
 
-    # Percentile-based clipping
     vmin, vmax = np.percentile(img_input[valid], (2, 98))
-    if vmax <= vmin:
-        vmax = vmin + 1e-6
+    vmax = max(vmax, vmin + 1e-6)
 
     img = np.clip((img_input - vmin) * 255.0 / (vmax - vmin), 0, 255).astype(np.uint8)
-
-    # Noise reduction
     img = cv2.medianBlur(img, 5)
 
-    # Local contrast enhancement (CLAHE)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
     img = clahe.apply(img)
 
-    # Sharpening
     kernel = np.array([[0, -1, 0],
                        [-1, 5, -1],
                        [0, -1, 0]])
     return cv2.filter2D(img, -1, kernel)
 
-# ================= NAVIGATION ORIGIN =================
+# ================= NAVIGATION =================
 
 def get_nav_origin(bag):
-    """
-    Retrieve the geographic origin (latitude, longitude) of the navigation
-    system from /sparus2/navigator/navigation.
-    """
     for _, msg, _ in bag.read_messages(topics=[NAV_TOPIC]):
-        if not hasattr(msg, 'origin'):
-            continue
-        if not hasattr(msg.origin, 'latitude'):
-            continue
-
-        lat0 = msg.origin.latitude
-        lon0 = msg.origin.longitude
-
-        print(f"✔ Navigation origin detected: lat={lat0}, lon={lon0}")
-        return lat0, lon0
-
+        if hasattr(msg, 'origin'):
+            lat0 = msg.origin.latitude
+            lon0 = msg.origin.longitude
+            print(f"✔ Navigation origin detected: lat={lat0}, lon={lon0}")
+            return lat0, lon0
     raise RuntimeError("Navigation geographic origin not found")
 
-# ================= NAVIGATION DATA =================
 
 def get_nav_data(bag):
-    """Load and interpolate navigation data."""
     ts, north, east, yaw, alt = [], [], [], [], []
 
     for _, msg, _ in bag.read_messages(topics=[NAV_TOPIC]):
-        if not hasattr(msg, 'header'):
-            continue
-
         ts.append(msg.header.stamp.to_sec())
         north.append(msg.position.north)
         east.append(msg.position.east)
         yaw.append(msg.orientation.yaw)
         alt.append(msg.altitude)
-
-    if len(ts) == 0:
-        raise RuntimeError("No navigation data found")
 
     ts = np.array(ts)
     idx = np.argsort(ts)
@@ -132,20 +117,15 @@ def get_nav_data(bag):
 
 # ================= SSS MOSAIC =================
 
-def process_mosaic(bag, nav, time_range):
-    """Generate a local SSS mosaic using navigation data."""
+def process_mosaic(bag, nav, time_range, off_x, off_y):
     f_n, f_e, f_y, f_h = nav
     t0, t1 = time_range
 
-    # --- Compute bounding box from vehicle trajectory ---
     ts_samples = np.linspace(t0, t1, 500)
     east_samples  = f_e(ts_samples)
     north_samples = f_n(ts_samples)
 
     valid = ~np.isnan(east_samples) & ~np.isnan(north_samples)
-    if not np.any(valid):
-        raise RuntimeError("Unable to estimate trajectory bounds")
-
     min_e, max_e = np.min(east_samples[valid]), np.max(east_samples[valid])
     min_n, max_n = np.min(north_samples[valid]), np.max(north_samples[valid])
 
@@ -164,38 +144,28 @@ def process_mosaic(bag, nav, time_range):
         r = ((y_max - y) / MOSAIC_RES).astype(np.int32)
         return c, r
 
-    # --- Detect valid SSS topics ---
     info = bag.get_type_and_topic_info()
     sss_topics = [
-        t for t, v in info.topics.items()
-        if "sidescan" in t and "Image" in v.msg_type
+    t for t, v in info.topics.items()
+    if "sidescan" in t.lower() and "Image" in v.msg_type
     ]
 
-    if len(sss_topics) == 0:
-        raise RuntimeError("No valid side-scan sonar topics found")
-
-    # --- Project SSS samples ---
     for topic, msg, _ in bag.read_messages(topics=sss_topics):
 
         if not hasattr(msg, 'header') or not hasattr(msg, 'data'):
             continue
-        if len(msg.data) == 0:
-            continue
 
         ts = msg.header.stamp.to_sec()
+
         if ts < t0 or ts > t1:
             continue
 
         n, e = f_n(ts), f_e(ts)
         yaw, h = f_y(ts), f_h(ts)
-
-        if np.isnan(n) or np.isnan(e) or np.isnan(yaw) or h < 0.2:
+        if np.isnan(n) or np.isnan(e) or h < 0.2:
             continue
 
         scan = np.frombuffer(msg.data, dtype=np.uint8).astype(np.float32)
-        if scan.size < 10:
-            continue
-
         if "port" in topic.lower():
             scan = scan[::-1]
             sign = -1
@@ -204,88 +174,77 @@ def process_mosaic(bag, nav, time_range):
 
         npx = scan.size
         meters_px = SONAR_RANGE / npx
-        slant = np.arange(npx, dtype=np.float32) * meters_px
+        slant = np.arange(npx) * meters_px
         ground = np.sqrt(np.maximum(slant**2 - h**2, 0.0))
-
         valid = ground > BLIND_ZONE
         if not np.any(valid):
             continue
 
-        v_right_n =  np.sin(yaw)
-        v_right_e =  -np.cos(yaw)
+        v_fwd_n =  np.cos(yaw)
+        v_fwd_e =  np.sin(yaw)
+        v_right_n = -np.sin(yaw)
+        v_right_e =  np.cos(yaw)
 
-        px_n = n + sign * v_right_n * ground[valid]
-        px_e = e + sign * v_right_e * ground[valid]
+        off_n = off_x * v_fwd_n + off_y * v_right_n
+        off_e = off_x * v_fwd_e + off_y * v_right_e
+
+        px_n = (n + off_n) + sign * v_right_n * ground[valid]
+        px_e = (e + off_e) + sign * v_right_e * ground[valid]
 
         c, r = to_idx(px_e, px_n)
         mask = (c >= 0) & (c < width) & (r >= 0) & (r < height)
-        if not np.any(mask):
-            continue
-
         idx = r[mask] * width + c[mask]
+
         np.add.at(grid, idx, scan[valid][mask])
         np.add.at(cnt, idx, 1)
 
-    img = np.zeros_like(grid, dtype=np.float32)
+    img = np.zeros_like(grid)
     valid = cnt > 0
     img[valid] = grid[valid] / cnt[valid]
 
     return img.reshape((height, width)), x_min, y_max
-
-# ================= SAVE GEOTIFF =================
-
-def save_geotiff(img, X0_UTM, Y0_UTM, x_min, y_max):
-    """Save the mosaic as a georeferenced GeoTIFF in UTM coordinates."""
-
-    img8 = enhance_data(img)
-    h, w = img8.shape
-
-    # Transform directly from local grid to UTM
-    transform = from_origin(
-        X0_UTM + x_min,   # top-left X in UTM
-        Y0_UTM + y_max,   # top-left Y in UTM
-        MOSAIC_RES,
-        MOSAIC_RES
-    )
-
-    with rasterio.open(
-        OUTPUT_TIFF,
-        'w',
-        driver='GTiff',
-        height=h,
-        width=w,
-        count=1,
-        dtype=np.uint8,
-        crs=CRS_UTM,          
-        transform=transform,
-        tiled=True,
-        blockxsize=256,
-        blockysize=256,
-        compress='deflate'
-    ) as dst:
-        dst.write(img8, 1)
-
-    print(f"✔ GeoTIFF generated correctly in UTM: {OUTPUT_TIFF}")
 
 # ================= MAIN =================
 
 def main():
     bag = rosbag.Bag(BAG_FILE)
 
-    # 1. Retrieve navigation origin
     lat0, lon0 = get_nav_origin(bag)
     X0_UTM, Y0_UTM = ll_to_utm.transform(lon0, lat0)
 
-    # 2. Load navigation data
     nav, t_range = get_nav_data(bag)
 
-    # 3. Generate SSS mosaic
-    img, x_min, y_max = process_mosaic(bag, nav, t_range)
+    T_SSS = get_static_tf(bag, BASE_FRAME, SSS_FRAME)
+    off_x, off_y = T_SSS[0, 3], T_SSS[1, 3]
+    print(f"✔ SSS offset from TF: x={off_x:.2f}, y={off_y:.2f}")
 
-    # 4. Save georeferenced GeoTIFF
-    save_geotiff(img, X0_UTM, Y0_UTM, x_min, y_max)
+    img, x_min, y_max = process_mosaic(bag, nav, t_range, off_x, off_y)
+
+    save_geotiff = from_origin(
+        X0_UTM + x_min,
+        Y0_UTM + y_max,
+        MOSAIC_RES,
+        MOSAIC_RES
+    )
+
+    img8 = enhance_data(img)
+
+    with rasterio.open(
+        OUTPUT_TIFF,
+        'w',
+        driver='GTiff',
+        height=img8.shape[0],
+        width=img8.shape[1],
+        count=1,
+        dtype=np.uint8,
+        crs=CRS_UTM,
+        transform=save_geotiff,
+        compress='deflate'
+    ) as dst:
+        dst.write(img8, 1)
 
     bag.close()
+    print("✔ GeoTIFF generated correctly")
 
 if __name__ == "__main__":
     main()
